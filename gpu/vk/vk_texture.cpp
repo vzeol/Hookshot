@@ -303,6 +303,8 @@ VkImageView make_view(Texture* tex, VkImageViewType type, VkFormat f, VkImageAsp
 // covariance, inset; GPL, as the decoder) into a buffer, copied into the image. Decoded RGBA8 took 6 GB of VRAM at
 // the title (the terrain's material arrays, 2048 x 2048 x 68, 1.45 GB each): more than the driver allowed, which
 // paged VRAM out and evicted textures that were made and uploaded again. RX_VK_ASTC_RGBA8=1: all as RGBA8.
+// (cards with 19 GB of VRAM or more keep them as RGBA8: BC3's 4x4 blocks showed on the ground and rocks next to the
+// ASTC, and RGBA8 held ~9 GB of textures at 60 fps in Kokiri Forest on a 24 GB card. RX_VK_ASTC_BC=1: BC3 anyway)
 struct BcPush {
     uint32_t blocks_x, blocks_y, width, height, bc3, out_offset;
 };
@@ -322,6 +324,15 @@ bool bc_ready() {
     if (state) return state > 0;
     state = -1;
     if (!astc_ready() || getenv("RX_VK_ASTC_RGBA8") || !dev.features.textureCompressionBC) return false;
+    if (!getenv("RX_VK_ASTC_BC")) {
+        uint64_t vram = 0;
+        for (uint32_t h = 0; h < dev.memory.memoryHeapCount; h++)
+            if (dev.memory.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) vram = std::max(vram, (uint64_t)dev.memory.memoryHeaps[h].size);
+        if (vram >= (19ull << 30)) {
+            logf("vk: big ASTC textures are kept as RGBA8 (%llu MB of VRAM; RX_VK_ASTC_BC=1: as BC3)", (unsigned long long)(vram >> 20));
+            return false;
+        }
+    }
     VkFormatProperties fp{};
     vkGetPhysicalDeviceFormatProperties(dev.physical, VK_FORMAT_BC3_UNORM_BLOCK, &fp);
     if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) return false;
