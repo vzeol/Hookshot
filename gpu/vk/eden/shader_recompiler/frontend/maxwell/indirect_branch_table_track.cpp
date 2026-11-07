@@ -16,6 +16,7 @@ union Encoding {
     u64 raw;
     BitField<0, 8, IR::Reg> dest_reg;
     BitField<8, 8, IR::Reg> src_reg;
+    BitField<20, 8, IR::Reg> src_reg_b;
     BitField<20, 19, u64> immediate;
     BitField<56, 1, u64> is_negative;
     BitField<20, 24, s64> brx_offset;
@@ -86,9 +87,43 @@ std::optional<IndirectBranchTableInfo> TrackIndirectBranchTable(Environment& env
     const Encoding shl{*shl_insn};
     const IR::Reg shl_reg{shl.src_reg};
 
+    const Location shl_pos{pos};
     const std::optional<u64> imnmx_insn{TrackIMNMX(env, block_begin, pos, shl_reg)};
     if (!imnmx_insn) {
-        return std::nullopt;
+        // (the lowered Ampere code clamps with ISETP + SEL instead of IMNMX, predicate saves in between:
+        //  MOV32I Rc, max; ISETP.LT P, Ri, Rc; SEL Rs, Ri, Rc, P; SHL Rs, Rs, 2; LDC; BRX. The table: max + 1 entries)
+        pos = shl_pos;
+        const std::optional<u64> sel_insn{Track(env, block_begin, pos, [shl_reg](u64 insn, Opcode opcode) {
+            return opcode == Opcode::SEL_reg && Encoding{insn}.dest_reg == shl_reg;
+        })};
+        if (!sel_insn) {
+            return std::nullopt;
+        }
+        const IR::Reg index_reg{Encoding{*sel_insn}.src_reg};
+        const IR::Reg max_reg{Encoding{*sel_insn}.src_reg_b};
+        const Location sel_pos{pos};
+        const std::optional<u64> isetp_insn{Track(env, block_begin, pos, [&](u64 insn, Opcode opcode) {
+            return opcode == Opcode::ISETP_reg && Encoding{insn}.src_reg == index_reg &&
+                   Encoding{insn}.src_reg_b == max_reg;
+        })};
+        pos = sel_pos;
+        const std::optional<u64> mov_insn{Track(env, block_begin, pos, [max_reg](u64 insn, Opcode opcode) {
+            return opcode == Opcode::MOV32I && Encoding{insn}.dest_reg == max_reg;
+        })};
+        if (!isetp_insn || !mov_insn) {
+            return std::nullopt;
+        }
+        const u32 max_index{static_cast<u32>(*mov_insn >> 20)};
+        if (max_index >= 256) {
+            return std::nullopt;
+        }
+        return IndirectBranchTableInfo{
+            .cbuf_index = cbuf_index,
+            .cbuf_offset = cbuf_offset,
+            .num_entries = max_index + 1,
+            .branch_offset = brx_offset,
+            .branch_reg = brx_reg,
+        };
     }
     const Encoding imnmx{*imnmx_insn};
     if (imnmx.is_negative != 0) {
